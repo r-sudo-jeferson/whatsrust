@@ -29,7 +29,7 @@ png = "0.17"
 prost = "0.14"
 qrcode = "0.14"
 rand = "0.8"
-rusqlite = { version = "0.37", features = ["bundled", "backup"] }
+rusqlite = { version = "0.37", features = ["bundled-sqlcipher", "backup"] }
 sha2 = "0.10"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
@@ -42,9 +42,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # We skip the default sqlite-storage feature to avoid Diesel/libsqlite3-sys conflicts.
 # Our own rusqlite backend (src/storage.rs) replaces it.
 # For local dev, .cargo/config.toml patches these to ../whatsapp-rust path deps.
-whatsapp-rust = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33", default-features = false, features = ["tokio-runtime", "tokio-transport", "ureq-client", "moka-cache", "simd", "signal", "tokio-native"] }
-wacore = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33" }
-wacore-binary = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33" }
+whatsapp-rust = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33", default-features = false, features = ["tokio-runtime", "tokio-transport", "ureq-client", "moka-cache", "signal", "tokio-native"] }
+wacore = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33", default-features = false }
+wacore-binary = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33", default-features = false }
 waproto = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33" }
 whatsapp-rust-tokio-transport = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33" }
 whatsapp-rust-ureq-http-client = { git = "https://github.com/199-biotechnologies/whatsapp-rust", rev = "9fb13a7bb1f91c3e32eccc517db2566068f15f33" }
