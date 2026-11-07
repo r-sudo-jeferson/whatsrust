@@ -7,6 +7,7 @@ pub mod mcp;
 pub mod media_utils;
 pub mod outbound;
 pub mod polls;
+pub mod private;
 pub mod qr;
 pub mod read_receipts;
 pub mod storage;

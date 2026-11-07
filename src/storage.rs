@@ -6,7 +6,7 @@
 //! Design advantages over upstream (Diesel, 2370 lines) and ZeroClaw (rusqlite, 1347 lines):
 //!   - Single-device only (no device_id column) — halves query complexity
 //!   - One Mutex<Connection> + spawn_blocking — no semaphore needed
-//!   - WAL mode + NORMAL sync — fast writes, no corruption risk
+//!   - WAL mode + FULL sync — committed inbox and protocol state survive a crash
 //!   - CREATE TABLE IF NOT EXISTS — no migration framework
 //!   - serde_json only for opaque types (HashState) — everything else is columns
 
@@ -29,6 +29,13 @@ use wacore::store::traits::*;
 use wacore::store::Device;
 use wacore_binary::jid::Jid;
 use waproto::whatsapp as wa;
+
+mod durable;
+pub use durable::InboundEnvelope;
+mod protocol_journal;
+pub use protocol_journal::ProtocolJournal;
+mod private_outbound;
+pub use private_outbound::{PrivateOutcome, PrivateAttempt};
 
 // ---------------------------------------------------------------------------
 // Schema — 15 tables, no device_id column (single-device design)
@@ -210,9 +217,41 @@ CREATE INDEX IF NOT EXISTS idx_outbound_status ON outbound_queue(status, retry_a
 CREATE INDEX IF NOT EXISTS idx_outbound_wa_id ON outbound_queue(wa_message_id);
 CREATE INDEX IF NOT EXISTS idx_inbound_chat_ts ON inbound_messages(chat_jid, timestamp);
 CREATE INDEX IF NOT EXISTS idx_inbound_msg_id ON inbound_messages(message_id);
+
+-- Full protocol sources survive the lossy legacy history/broadcast projections.
+CREATE TABLE IF NOT EXISTS inbound_envelopes (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    received_count INTEGER NOT NULL DEFAULT 1,
+    acknowledged INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_envelopes_pending ON inbound_envelopes(acknowledged, created_at, id);
+CREATE TABLE IF NOT EXISTS protocol_sources (
+    raw_id TEXT PRIMARY KEY REFERENCES inbound_envelopes(id),
+    required_decoded INTEGER NOT NULL,
+    completed INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS private_session (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    terminal TEXT NOT NULL DEFAULT ''
+);
+INSERT OR IGNORE INTO private_session(id) VALUES(1);
+CREATE TABLE IF NOT EXISTS private_identity (
+    id INTEGER PRIMARY KEY CHECK(id=1), incarnation TEXT NOT NULL
+);
+INSERT OR IGNORE INTO private_identity VALUES(1,lower(hex(randomblob(16))));
+CREATE TABLE IF NOT EXISTS private_outbound (
+    id TEXT PRIMARY KEY, recipient TEXT NOT NULL, body TEXT NOT NULL,
+    message_id TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK(state IN ('prepared','uncertain','sent','delivered','read','cancelled')),
+    created_at INTEGER NOT NULL
+);
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 7;
+const CURRENT_SCHEMA_VERSION: i64 = 11;
 
 #[cfg(unix)]
 fn secure_backup_permissions(path: &Path) -> Result<()> {
@@ -240,6 +279,7 @@ fn secure_backup_permissions(_path: &Path) -> Result<()> {
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
+    encryption_key: Option<Arc<[u8; 32]>>,
 }
 
 /// A row from the inbound message history table.
@@ -264,10 +304,20 @@ pub struct PruneStats {
 impl Store {
     /// Open (or create) the database at `path` and initialize the schema.
     pub fn new(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path).map_err(db_err)?;
+        Self::open(path, None)
+    }
+
+    /// Open one number's encrypted session. Callers supply a random key over a
+    /// private channel; it is never a command argument, database field or log.
+    pub fn new_encrypted(path: &Path, key: [u8; 32]) -> Result<Self> {
+        Self::open(path, Some(Arc::new(key)))
+    }
+
+    fn open(path: &Path, encryption_key: Option<Arc<[u8; 32]>>) -> Result<Self> {
+        let conn = Self::open_connection(path, encryption_key.as_deref())?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
+             PRAGMA synchronous = FULL;
              PRAGMA busy_timeout = 5000;
              PRAGMA cache_size = -2000;
              PRAGMA foreign_keys = ON;
@@ -286,7 +336,34 @@ impl Store {
         run_schema_migrations(&conn, schema_version)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            encryption_key,
         })
+    }
+
+    fn open_connection(path: &Path, key: Option<&[u8; 32]>) -> Result<Connection> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new().create(true).append(true).mode(0o600)
+                .open(path).map_err(db_err)?;
+        }
+        let conn = Connection::open(path).map_err(db_err)?;
+        secure_backup_permissions(path)?;
+        if let Some(key) = key {
+            let version: String = conn.pragma_query_value(None, "cipher_version", |r| r.get(0))
+                .map_err(|_| StoreError::Database("SQLCipher is required".into()))?;
+            if version.is_empty() {
+                return Err(StoreError::Database("SQLCipher is required".into()));
+            }
+            let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+            conn.pragma_update(None, "key", format!("x'{hex}'"))
+                .map_err(|_| StoreError::Database("session key rejected".into()))?;
+            conn.pragma_update(None, "cipher_memory_security", "ON").map_err(db_err)?;
+        }
+        // Force key validation before returning a connection (including backups).
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))
+            .map_err(|_| StoreError::Database("session database could not be opened".into()))?;
+        Ok(conn)
     }
 
     /// Run a blocking database operation on a dedicated thread.
@@ -307,7 +384,7 @@ impl Store {
     /// Create a hot backup of the database using SQLite's backup API.
     pub fn snapshot_db(&self, dest_path: &Path) -> Result<()> {
         let guard = self.conn.lock();
-        let mut dest = Connection::open(dest_path).map_err(db_err)?;
+        let mut dest = Self::open_connection(dest_path, self.encryption_key.as_deref())?;
         let backup = rusqlite::backup::Backup::new(&guard, &mut dest).map_err(db_err)?;
         backup
             .run_to_completion(100, std::time::Duration::from_millis(10), None)
@@ -323,6 +400,17 @@ impl Store {
                 .map_err(db_err)
         })
         .await
+    }
+
+    pub(crate) fn session_terminal(&self) -> Result<String> {
+        self.conn.lock().query_row("SELECT terminal FROM private_session WHERE id=1", [], |r| r.get(0)).map_err(db_err)
+    }
+
+    pub(crate) async fn set_session_terminal(&self, terminal: &'static str) -> Result<()> {
+        self.run(move |conn| {
+            conn.execute("UPDATE private_session SET terminal=?1 WHERE id=1", [terminal]).map_err(db_err)?;
+            Ok(())
+        }).await
     }
 
     // -----------------------------------------------------------------------
@@ -346,32 +434,19 @@ impl Store {
         .await
     }
 
-    /// Mark an outbound message as failed (increment retries).
-    /// If retries >= max_retries, status becomes 'failed'; otherwise back to 'queued'
-    /// with exponential backoff via `retry_after` (1s, 2s, 4s, 8s, ...).
-    /// This prevents head-of-line blocking: newer messages flow while failed ones wait.
+    /// Preserve an attempted send for reconciliation. A transport error cannot
+    /// establish non-delivery. Only preflight rejection (max_retries = 0) is failed.
     pub async fn mark_outbound_failed(&self, id: i64, max_retries: i32) -> Result<()> {
         let ts = now_secs();
         self.run(move |c| {
-            // Read current retry count to compute backoff
-            let retries: i32 = c
-                .query_row(
-                    "SELECT retries FROM outbound_queue WHERE id = ?1",
-                    params![id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(db_err)?
-                .unwrap_or(0);
-            let backoff_secs = 1i64 << retries.min(6); // 1, 2, 4, 8, 16, 32, 64 max
             c.execute(
                 "UPDATE outbound_queue SET
                     retries = retries + 1,
-                    status = CASE WHEN retries + 1 >= ?1 THEN 'failed' ELSE 'queued' END,
-                    retry_after = CASE WHEN retries + 1 >= ?1 THEN 0 ELSE ?4 END,
+                    status = CASE WHEN ?1 = 0 THEN 'failed' ELSE 'uncertain' END,
+                    retry_after = 0,
                     updated_at = ?2
-                 WHERE id = ?3",
-                params![max_retries, ts, id, ts + backoff_secs],
+                 WHERE id = ?3 AND status = 'inflight'",
+                params![max_retries, ts, id],
             )
             .map_err(db_err)?;
             Ok(())
@@ -379,14 +454,14 @@ impl Store {
         .await
     }
 
-    /// Requeue messages stuck in 'inflight' for longer than the given threshold.
-    /// This handles process crashes where inflight messages were never completed.
+    /// Quarantine interrupted attempts. The legacy method name is retained for
+    /// callers, but these jobs must never become eligible for automatic resend.
     pub async fn requeue_stale_inflight(&self, older_than_secs: i64) -> Result<u32> {
         let cutoff = now_secs() - older_than_secs;
         self.run(move |c| {
             let count = c
                 .execute(
-                    "UPDATE outbound_queue SET status = 'queued', updated_at = ?1
+                    "UPDATE outbound_queue SET status = 'uncertain', updated_at = ?1
                      WHERE status = 'inflight' AND updated_at < ?2",
                     params![now_secs(), cutoff],
                 )
@@ -398,12 +473,12 @@ impl Store {
         .await
     }
 
-    /// Requeue a specific outbound message without incrementing retries.
-    /// Used when the message can't be sent due to connection issues (not send failures).
+    /// Preserve a claimed job as uncertain on connection loss or shutdown.
+    /// A caller without durable evidence of non-send cannot safely requeue it.
     pub async fn requeue_outbound(&self, id: i64) -> Result<()> {
         self.run(move |c| {
             c.execute(
-                "UPDATE outbound_queue SET status = 'queued', updated_at = ?1 WHERE id = ?2",
+                "UPDATE outbound_queue SET status = 'uncertain', updated_at = ?1 WHERE id = ?2 AND status = 'inflight'",
                 params![now_secs(), id],
             )
             .map_err(db_err)?;
