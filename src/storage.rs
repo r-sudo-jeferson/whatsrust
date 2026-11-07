@@ -346,32 +346,19 @@ impl Store {
         .await
     }
 
-    /// Mark an outbound message as failed (increment retries).
-    /// If retries >= max_retries, status becomes 'failed'; otherwise back to 'queued'
-    /// with exponential backoff via `retry_after` (1s, 2s, 4s, 8s, ...).
-    /// This prevents head-of-line blocking: newer messages flow while failed ones wait.
+    /// Preserve an attempted send for reconciliation. A transport error cannot
+    /// establish non-delivery. Only preflight rejection (max_retries = 0) is failed.
     pub async fn mark_outbound_failed(&self, id: i64, max_retries: i32) -> Result<()> {
         let ts = now_secs();
         self.run(move |c| {
-            // Read current retry count to compute backoff
-            let retries: i32 = c
-                .query_row(
-                    "SELECT retries FROM outbound_queue WHERE id = ?1",
-                    params![id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(db_err)?
-                .unwrap_or(0);
-            let backoff_secs = 1i64 << retries.min(6); // 1, 2, 4, 8, 16, 32, 64 max
             c.execute(
                 "UPDATE outbound_queue SET
                     retries = retries + 1,
-                    status = CASE WHEN retries + 1 >= ?1 THEN 'failed' ELSE 'queued' END,
-                    retry_after = CASE WHEN retries + 1 >= ?1 THEN 0 ELSE ?4 END,
+                    status = CASE WHEN ?1 = 0 THEN 'failed' ELSE 'uncertain' END,
+                    retry_after = 0,
                     updated_at = ?2
-                 WHERE id = ?3",
-                params![max_retries, ts, id, ts + backoff_secs],
+                 WHERE id = ?3 AND status = 'inflight'",
+                params![max_retries, ts, id],
             )
             .map_err(db_err)?;
             Ok(())
@@ -379,14 +366,14 @@ impl Store {
         .await
     }
 
-    /// Requeue messages stuck in 'inflight' for longer than the given threshold.
-    /// This handles process crashes where inflight messages were never completed.
+    /// Quarantine interrupted attempts. The legacy method name is retained for
+    /// callers, but these jobs must never become eligible for automatic resend.
     pub async fn requeue_stale_inflight(&self, older_than_secs: i64) -> Result<u32> {
         let cutoff = now_secs() - older_than_secs;
         self.run(move |c| {
             let count = c
                 .execute(
-                    "UPDATE outbound_queue SET status = 'queued', updated_at = ?1
+                    "UPDATE outbound_queue SET status = 'uncertain', updated_at = ?1
                      WHERE status = 'inflight' AND updated_at < ?2",
                     params![now_secs(), cutoff],
                 )
@@ -398,12 +385,12 @@ impl Store {
         .await
     }
 
-    /// Requeue a specific outbound message without incrementing retries.
-    /// Used when the message can't be sent due to connection issues (not send failures).
+    /// Preserve a claimed job as uncertain on connection loss or shutdown.
+    /// A caller without durable evidence of non-send cannot safely requeue it.
     pub async fn requeue_outbound(&self, id: i64) -> Result<()> {
         self.run(move |c| {
             c.execute(
-                "UPDATE outbound_queue SET status = 'queued', updated_at = ?1 WHERE id = ?2",
+                "UPDATE outbound_queue SET status = 'uncertain', updated_at = ?1 WHERE id = ?2 AND status = 'inflight'",
                 params![now_secs(), id],
             )
             .map_err(db_err)?;
