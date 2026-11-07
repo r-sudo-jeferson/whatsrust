@@ -32,6 +32,8 @@ use waproto::whatsapp as wa;
 
 mod durable;
 pub use durable::InboundEnvelope;
+mod protocol_journal;
+pub use protocol_journal::ProtocolJournal;
 
 // ---------------------------------------------------------------------------
 // Schema — 15 tables, no device_id column (single-device design)
@@ -225,9 +227,14 @@ CREATE TABLE IF NOT EXISTS inbound_envelopes (
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_envelopes_pending ON inbound_envelopes(acknowledged, created_at, id);
+CREATE TABLE IF NOT EXISTS protocol_sources (
+    raw_id TEXT PRIMARY KEY REFERENCES inbound_envelopes(id),
+    required_decoded INTEGER NOT NULL,
+    completed INTEGER NOT NULL DEFAULT 0
+);
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const CURRENT_SCHEMA_VERSION: i64 = 9;
 
 #[cfg(unix)]
 fn secure_backup_permissions(path: &Path) -> Result<()> {

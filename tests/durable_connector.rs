@@ -96,3 +96,50 @@ async fn ac_m0_11_ingress_replays_unacknowledged_sources_and_preserves_edits() {
     std::fs::remove_dir_all(db.parent().unwrap()).unwrap();
     std::fs::remove_dir_all(other.parent().unwrap()).unwrap();
 }
+
+#[tokio::test]
+async fn ac_m0_11_ingress_protocol_journal_requires_decoded_commit_and_survives_restart() {
+    use prost::Message;
+    use wacore_binary::builder::NodeBuilder;
+    use whatsapp_rust::{inbound_journal::InboundJournal, types::message::MessageInfo};
+    use whatsrust::storage::ProtocolJournal;
+    let db = path("protocol-journal");
+    let key = [0x51; 32];
+    let info = MessageInfo { id: "source-a".into(), ..Default::default() };
+    let node = NodeBuilder::new("message").attr("id", "source-a")
+        .children([NodeBuilder::new("enc").bytes(vec![1,2,3]).build()]).build();
+    let full = waproto::whatsapp::Message { conversation: Some("private retained original".into()), ..Default::default() };
+    let store = Store::new_encrypted(&db, key).unwrap();
+    let journal = ProtocolJournal::new(store.clone());
+    assert!(!journal.begin(&node, Some(&info)).await.unwrap());
+    assert!(journal.complete(&node).await.is_err(), "encrypted source ACKed without a durable decoded message");
+    journal.decoded(&info, &full).await.unwrap();
+    // A restart between decoded commit and completion must not require a consumed ratchet again.
+    drop(journal);
+    drop(store);
+    let resumed = Store::new_encrypted(&db, key).unwrap();
+    let journal = ProtocolJournal::new(resumed.clone());
+    assert!(journal.begin(&node, Some(&info)).await.unwrap());
+    assert!(journal.complete(&node).await.unwrap());
+    let pending = resumed.pending_inbound_envelopes(100).await.unwrap();
+    assert_eq!(pending.len(), 2, "raw source or full decoded message was lost");
+    let decoded = pending.iter().find(|e| e.kind == "decoded").unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&decoded.payload).unwrap();
+    let bytes: Vec<u8> = serde_json::from_value(body["protobuf"].clone()).unwrap();
+    assert_eq!(waproto::whatsapp::Message::decode(bytes.as_slice()).unwrap(), full);
+    assert_eq!(body["info"]["id"], "source-a");
+    assert!(resumed.acknowledge_inbound_envelope(&decoded.id).await.unwrap());
+    assert!(journal.begin(&node, Some(&info)).await.unwrap());
+    assert!(journal.complete(&node).await.unwrap());
+    assert_eq!(resumed.pending_inbound_envelopes(100).await.unwrap().len(), 1);
+    // A distinct raw variant is never declared complete from another variant's decoded data.
+    let variant = NodeBuilder::new("message").attr("id", "source-a")
+        .children([NodeBuilder::new("enc").bytes(vec![4,5,6]).build()]).build();
+    assert!(!journal.begin(&variant, Some(&info)).await.unwrap());
+    assert!(journal.complete(&variant).await.is_err());
+    let unsupported = NodeBuilder::new("message").attr("id", "unsupported-a").build();
+    assert!(!journal.begin(&unsupported, None).await.unwrap());
+    assert!(!journal.complete(&unsupported).await.unwrap());
+    assert!(resumed.pending_inbound_envelopes(100).await.unwrap().iter().any(|e| e.kind == "raw" && e.payload.windows(13).any(|w| w == b"unsupported-a")));
+    std::fs::remove_dir_all(db.parent().unwrap()).unwrap();
+}
