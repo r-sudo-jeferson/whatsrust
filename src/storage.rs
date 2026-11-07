@@ -232,9 +232,14 @@ CREATE TABLE IF NOT EXISTS protocol_sources (
     required_decoded INTEGER NOT NULL,
     completed INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS private_session (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    terminal TEXT NOT NULL DEFAULT ''
+);
+INSERT OR IGNORE INTO private_session(id) VALUES(1);
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 9;
+const CURRENT_SCHEMA_VERSION: i64 = 10;
 
 #[cfg(unix)]
 fn secure_backup_permissions(path: &Path) -> Result<()> {
@@ -383,6 +388,17 @@ impl Store {
                 .map_err(db_err)
         })
         .await
+    }
+
+    pub(crate) fn session_terminal(&self) -> Result<String> {
+        self.conn.lock().query_row("SELECT terminal FROM private_session WHERE id=1", [], |r| r.get(0)).map_err(db_err)
+    }
+
+    pub(crate) async fn set_session_terminal(&self, terminal: &'static str) -> Result<()> {
+        self.run(move |conn| {
+            conn.execute("UPDATE private_session SET terminal=?1 WHERE id=1", [terminal]).map_err(db_err)?;
+            Ok(())
+        }).await
     }
 
     // -----------------------------------------------------------------------
