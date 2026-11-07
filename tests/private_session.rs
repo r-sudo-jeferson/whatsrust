@@ -80,3 +80,30 @@ async fn ac_m0_11_outbound_private_intent_is_immutable_and_uncertain_is_never_re
     assert_eq!(resumed.store().private_outcome(id).await.unwrap().state,"read", "late weaker evidence downgraded read");
     std::fs::remove_dir_all(a.parent().unwrap()).unwrap();
 }
+
+#[tokio::test]
+async fn ac_m0_11_outbound_transport_failure_preserves_uncertainty_without_retry() {
+    use std::sync::atomic::{AtomicUsize,Ordering};
+    use whatsrust::private::SendTransport;
+    struct LostResponse(AtomicUsize);
+    #[async_trait::async_trait]
+    impl SendTransport for LostResponse {
+        async fn send(&self,_: &str,_: &str,_: &str)->anyhow::Result<()> {
+            self.0.fetch_add(1,Ordering::SeqCst);
+            anyhow::bail!("synthetic network response lost after acceptance");
+        }
+    }
+    let a=path(); let session=PrivateSession::open(&a,[0x72;32]).unwrap();
+    let id="74000000-0000-0000-0000-000000000001";
+    session.store().prepare_private_outbound(id,"15550000012@s.whatsapp.net","Open the authenticated portal.").await.unwrap();
+    let wire=LostResponse(AtomicUsize::new(0));
+    assert!(session.store().dispatch_private(&wire,id).await.is_err());
+    assert_eq!(session.store().private_outcome(id).await.unwrap().state,"uncertain");
+    assert_eq!(session.store().dispatch_private(&wire,id).await.unwrap().state,"uncertain");
+    assert_eq!(wire.0.load(Ordering::SeqCst),1);
+    drop(session);
+    let resumed=PrivateSession::open(&a,[0x72;32]).unwrap();
+    assert_eq!(resumed.store().dispatch_private(&wire,id).await.unwrap().state,"uncertain");
+    assert_eq!(wire.0.load(Ordering::SeqCst),1,"restarted dispatcher blindly resent a possibly accepted message");
+    std::fs::remove_dir_all(a.parent().unwrap()).unwrap();
+}

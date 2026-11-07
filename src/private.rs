@@ -7,6 +7,33 @@ use std::{path::Path, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 use whatsapp_rust::{bot::{Bot, BotHandle}, pair_code::PairCodeOptions, types::events::Event, Client};
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
+use crate::storage::PrivateOutcome;
+use wacore::types::presence::ReceiptType;
+
+/// The seam is only the external send, never the durable intent/state machine.
+#[async_trait::async_trait]
+pub trait SendTransport: Send + Sync {
+    async fn send(&self, message_id: &str, recipient: &str, body: &str) -> Result<()>;
+}
+#[async_trait::async_trait]
+impl SendTransport for Arc<Client> {
+    async fn send(&self, message_id: &str, recipient: &str, body: &str) -> Result<()> {
+        let recipient=recipient.parse().map_err(|_| anyhow!("invalid_recipient"))?;
+        self.send_message_with_options(recipient, waproto::whatsapp::Message {conversation:Some(body.into()), ..Default::default()}, whatsapp_rust::send::SendOptions {message_id:Some(message_id.into()), ..Default::default()})
+            .await.map_err(|_| anyhow!("outcome_uncertain"))?;
+        Ok(())
+    }
+}
+impl Store {
+    pub async fn dispatch_private(&self, transport: &dyn SendTransport, id: &str) -> Result<PrivateOutcome> {
+        let Some(attempt)=self.claim_private_outbound(id).await.map_err(|_| anyhow!("outbound_storage_failed"))? else {
+            return self.private_outcome(id).await.map_err(|_| anyhow!("intent_unavailable"));
+        };
+        transport.send(&attempt.outcome.message_id,&attempt.recipient,&attempt.body).await.map_err(|_| anyhow!("outcome_uncertain"))?;
+        self.record_private_sent(id).await.map_err(|_| anyhow!("outcome_uncertain"))?;
+        self.private_outcome(id).await.map_err(|_| anyhow!("outcome_uncertain"))
+    }
+}
 
 // No Debug on any private challenge/configuration/event payload.
 #[derive(Clone, serde::Serialize)]
@@ -52,6 +79,17 @@ impl PrivateSession {
     /// Apply only typed protocol events from this session's Client. Not an IPC
     /// command: untrusted callers cannot assert connection/delivery state.
     pub async fn observe(&self, event: Event) -> Result<()> {
+        // Reconciliation evidence remains useful after revocation; it confers no
+        // right to send or to disclose the private event to company users.
+        if let Event::Receipt(ref receipt)=event {
+            let state=match receipt.r#type {ReceiptType::Delivered=>Some("delivered"),ReceiptType::Read=>Some("read"),_=>None};
+            if let Some(state)=state {
+                for id in &receipt.message_ids {
+                    self.store.record_private_receipt(id,&receipt.source.chat.to_string(),state).await.map_err(|_| anyhow!("receipt_storage_failed"))?;
+                }
+            }
+            return Ok(());
+        }
         let mut persist = None;
         {
             let mut state = self.state.lock();
@@ -137,6 +175,12 @@ impl PrivateSession {
         let client=self.client.lock().take();
         if let Some(client)=client {client.disconnect().await;}
         if let Some(task)=self.task.lock().take() {task.abort();}
+    }
+
+    pub async fn dispatch(&self,id:&str)->Result<PrivateOutcome> {
+        ensure!(self.snapshot().state=="active","session_not_active");
+        let client=self.client.lock().clone().ok_or_else(|| anyhow!("session_not_active"))?;
+        self.store.dispatch_private(&client,id).await
     }
 }
 impl Drop for PrivateSession {
