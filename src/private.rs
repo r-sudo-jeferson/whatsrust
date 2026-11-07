@@ -21,6 +21,7 @@ use whatsapp_rust::{
 };
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
+pub mod capabilities;
 mod sources;
 pub use sources::{MediaBuffer, MediaTransport, PrivateSource};
 
