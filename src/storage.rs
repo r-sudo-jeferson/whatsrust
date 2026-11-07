@@ -34,6 +34,8 @@ mod durable;
 pub use durable::InboundEnvelope;
 mod protocol_journal;
 pub use protocol_journal::ProtocolJournal;
+mod private_outbound;
+pub use private_outbound::{PrivateOutcome, PrivateAttempt};
 
 // ---------------------------------------------------------------------------
 // Schema — 15 tables, no device_id column (single-device design)
@@ -237,9 +239,19 @@ CREATE TABLE IF NOT EXISTS private_session (
     terminal TEXT NOT NULL DEFAULT ''
 );
 INSERT OR IGNORE INTO private_session(id) VALUES(1);
+CREATE TABLE IF NOT EXISTS private_identity (
+    id INTEGER PRIMARY KEY CHECK(id=1), incarnation TEXT NOT NULL
+);
+INSERT OR IGNORE INTO private_identity VALUES(1,lower(hex(randomblob(16))));
+CREATE TABLE IF NOT EXISTS private_outbound (
+    id TEXT PRIMARY KEY, recipient TEXT NOT NULL, body TEXT NOT NULL,
+    message_id TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK(state IN ('prepared','uncertain','sent','delivered','read','cancelled')),
+    created_at INTEGER NOT NULL
+);
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 10;
+const CURRENT_SCHEMA_VERSION: i64 = 11;
 
 #[cfg(unix)]
 fn secure_backup_permissions(path: &Path) -> Result<()> {

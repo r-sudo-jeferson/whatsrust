@@ -17,7 +17,7 @@ pub struct InboundEnvelope {
 }
 
 impl Store {
-    fn require_encrypted_journal(&self) -> Result<()> {
+    pub(super) fn require_encrypted_journal(&self) -> Result<()> {
         if self.encryption_key.is_none() {
             return Err(StoreError::Database("durable intake requires an encrypted session".into()));
         }

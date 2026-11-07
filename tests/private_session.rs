@@ -48,3 +48,35 @@ async fn ac_m0_11_pairing_reconnect_repair_isolated_private_challenges() {
     std::fs::remove_dir_all(a.parent().unwrap()).unwrap();
     std::fs::remove_dir_all(b.parent().unwrap()).unwrap();
 }
+
+#[tokio::test]
+async fn ac_m0_11_outbound_private_intent_is_immutable_and_uncertain_is_never_reexecuted() {
+    let a=path();
+    let session=PrivateSession::open(&a,[0x71;32]).unwrap();
+    let id="73000000-0000-0000-0000-000000000001";
+    let destination="15550000010@s.whatsapp.net";
+    let first=session.store().prepare_private_outbound(id,destination,"Open the authenticated portal.").await.unwrap();
+    assert_eq!(first.state,"prepared");
+    let same=session.store().prepare_private_outbound(id,destination,"Open the authenticated portal.").await.unwrap();
+    assert_eq!(first.message_id,same.message_id);
+    assert!(session.store().prepare_private_outbound(id,destination,"different text").await.is_err());
+    assert!(session.store().prepare_private_outbound(id,"15550000011@s.whatsapp.net","Open the authenticated portal.").await.is_err());
+    let claimed=session.store().claim_private_outbound(id).await.unwrap().unwrap();
+    assert_eq!(claimed.outcome.state,"uncertain", "network attempt started without durable uncertainty");
+    assert_eq!(claimed.outcome.message_id,first.message_id);
+    assert!(session.store().claim_private_outbound(id).await.unwrap().is_none());
+    drop(session);
+    let resumed=PrivateSession::open(&a,[0x71;32]).unwrap();
+    assert_eq!(resumed.store().private_outcome(id).await.unwrap().state,"uncertain");
+    assert!(resumed.store().claim_private_outbound(id).await.unwrap().is_none(),"restart authorized a duplicate send");
+    assert!(resumed.store().private_outcome("unknown-intent").await.is_err());
+    // A receipt for another conversation cannot upgrade this intent.
+    resumed.store().record_private_receipt(&first.message_id,"15550000011@s.whatsapp.net","delivered").await.unwrap();
+    assert_eq!(resumed.store().private_outcome(id).await.unwrap().state,"uncertain");
+    resumed.store().record_private_receipt(&first.message_id,destination,"read").await.unwrap();
+    assert_eq!(resumed.store().private_outcome(id).await.unwrap().state,"read");
+    resumed.store().record_private_sent(id).await.unwrap();
+    resumed.store().record_private_receipt(&first.message_id,destination,"delivered").await.unwrap();
+    assert_eq!(resumed.store().private_outcome(id).await.unwrap().state,"read", "late weaker evidence downgraded read");
+    std::fs::remove_dir_all(a.parent().unwrap()).unwrap();
+}
