@@ -30,6 +30,9 @@ use wacore::store::Device;
 use wacore_binary::jid::Jid;
 use waproto::whatsapp as wa;
 
+mod durable;
+pub use durable::InboundEnvelope;
+
 // ---------------------------------------------------------------------------
 // Schema — 15 tables, no device_id column (single-device design)
 // ---------------------------------------------------------------------------
@@ -210,9 +213,21 @@ CREATE INDEX IF NOT EXISTS idx_outbound_status ON outbound_queue(status, retry_a
 CREATE INDEX IF NOT EXISTS idx_outbound_wa_id ON outbound_queue(wa_message_id);
 CREATE INDEX IF NOT EXISTS idx_inbound_chat_ts ON inbound_messages(chat_jid, timestamp);
 CREATE INDEX IF NOT EXISTS idx_inbound_msg_id ON inbound_messages(message_id);
+
+-- Full protocol sources survive the lossy legacy history/broadcast projections.
+CREATE TABLE IF NOT EXISTS inbound_envelopes (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    received_count INTEGER NOT NULL DEFAULT 1,
+    acknowledged INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_envelopes_pending ON inbound_envelopes(acknowledged, created_at, id);
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 7;
+const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 #[cfg(unix)]
 fn secure_backup_permissions(path: &Path) -> Result<()> {

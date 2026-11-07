@@ -56,3 +56,43 @@ async fn ac_m0_11_privacy_session_and_backup_require_the_number_key() {
     }
     std::fs::remove_dir_all(db.parent().unwrap()).unwrap();
 }
+
+#[tokio::test]
+async fn ac_m0_11_ingress_replays_unacknowledged_sources_and_preserves_edits() {
+    let db = path("inbox");
+    let key = [0x41; 32];
+    let source = "15550000004@s.whatsapp.net/message-a";
+    let original = br#"{"text":"synthetic original","media_key":[1,2,3]}"#;
+    let edit = br#"{"text":"synthetic edit","media_key":[4,5,6]}"#;
+    let store = Store::new_encrypted(&db, key).unwrap();
+    let first = store.persist_inbound_envelope("decoded", source, original).await.unwrap();
+    let duplicate = store.persist_inbound_envelope("decoded", source, original).await.unwrap();
+    let changed = store.persist_inbound_envelope("decoded", source, edit).await.unwrap();
+    assert_eq!(first, duplicate);
+    assert_ne!(first, changed, "an edit was collapsed into its original");
+    drop(store); // Crash boundary: durable commit, but no application ACK.
+    let resumed = Store::new_encrypted(&db, key).unwrap();
+    let pending = resumed.pending_inbound_envelopes(100).await.unwrap();
+    assert_eq!(pending.len(), 2);
+    let saved = pending.iter().find(|e| e.id == first).unwrap();
+    assert_eq!(saved.payload, original);
+    assert_eq!(saved.received_count, 2);
+    assert_eq!(saved.source_id, source);
+    assert_eq!(saved.kind, "decoded");
+    assert_eq!(pending.iter().find(|e| e.id == changed).unwrap().payload, edit);
+    assert!(!resumed.acknowledge_inbound_envelope("unknown").await.unwrap());
+    assert!(resumed.acknowledge_inbound_envelope(&first).await.unwrap());
+    drop(resumed); // Crash boundary: application ACK committed.
+    let resumed = Store::new_encrypted(&db, key).unwrap();
+    let pending = resumed.pending_inbound_envelopes(100).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, changed);
+    assert_eq!(resumed.persist_inbound_envelope("decoded", source, original).await.unwrap(), first);
+    assert_eq!(resumed.pending_inbound_envelopes(100).await.unwrap().len(), 1, "ACKed duplicate was offered for business ingestion again");
+    let other = path("other-inbox");
+    let other_store = Store::new_encrypted(&other, [0x42; 32]).unwrap();
+    assert!(other_store.pending_inbound_envelopes(100).await.unwrap().is_empty());
+    assert!(!other_store.acknowledge_inbound_envelope(&changed).await.unwrap());
+    std::fs::remove_dir_all(db.parent().unwrap()).unwrap();
+    std::fs::remove_dir_all(other.parent().unwrap()).unwrap();
+}
