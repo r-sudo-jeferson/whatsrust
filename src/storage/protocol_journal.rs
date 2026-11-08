@@ -84,7 +84,14 @@ impl InboundJournal for ProtocolJournal {
             .store
             .persist_inbound_envelope("raw", "stanza", &raw_bytes(node)?)
             .await?;
-        let required = decoded_parts(node);
+        // An encrypted notification/call is not a decoded Message. Retain its
+        // exact raw source as visible unsupported; only the message handler owns
+        // the decoded-message commit points and Signal replay boundary.
+        let required = if node.tag.as_ref() == "message" {
+            decoded_parts(node)
+        } else {
+            0
+        };
         let raw = id.clone();
         let ready = self.store.run(move |conn| {
             conn.execute("INSERT INTO protocol_sources(raw_id,required_decoded) VALUES(?1,?2) ON CONFLICT DO NOTHING", params![raw, required]).map_err(db_err)?;
