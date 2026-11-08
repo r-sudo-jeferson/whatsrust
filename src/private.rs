@@ -7,6 +7,7 @@ use crate::{
 };
 use anyhow::{anyhow, bail, ensure, Result};
 use parking_lot::Mutex;
+use rand::RngCore;
 use std::{
     path::Path,
     sync::Arc,
@@ -159,6 +160,34 @@ impl PrivateSession {
     /// Apply only typed protocol events from this session's Client. Not an IPC
     /// command: untrusted callers cannot assert connection/delivery state.
     pub async fn observe(&self, event: Event) -> Result<()> {
+        let policy = capabilities::event_policy(&event);
+        if matches!(event, Event::Message(_, _)) {
+            // The protocol journal retains exact decoded bytes before dispatch
+            // or ACK. Do not duplicate that message as an unsupported event.
+            return Ok(());
+        }
+        let payload = if policy.reason == "private_pairing_material_omitted" {
+            serde_json::to_vec(
+                &serde_json::json!({"event":policy.message_type,"reason":policy.reason}),
+            )
+        } else {
+            serde_json::to_vec(&event)
+        }
+        .map_err(|_| anyhow!("event_encoding_failed"))?;
+        // Protocol events without a stable upstream identity are occurrences,
+        // not replayable message IDs. A later identical event must remain visible
+        // after the preceding occurrence's application ACK.
+        let mut occurrence = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut occurrence);
+        let occurrence: String = occurrence.iter().map(|b| format!("{b:02x}")).collect();
+        self.store
+            .persist_inbound_envelope(
+                "event",
+                &format!("{}:{occurrence}", policy.message_type),
+                &payload,
+            )
+            .await
+            .map_err(|_| anyhow!("event_storage_failed"))?;
         // Reconciliation evidence remains useful after revocation; it confers no
         // right to send or to disclose the private event to company users.
         if let Event::Receipt(ref receipt) = event {

@@ -129,7 +129,14 @@ impl Store {
             out.message_type = out.envelope.kind.clone();
             out.reason = "specialized_handling_pending";
             if out.envelope.kind == "event" {
-                out.message_type = out.envelope.source_id.clone();
+                let kind = out
+                    .envelope
+                    .source_id
+                    .split_once(':')
+                    .map_or(out.envelope.source_id.as_str(), |(kind, _)| kind);
+                let policy = super::capabilities::event_type_policy(kind);
+                out.message_type = kind.into();
+                out.reason = policy.reason;
             } else if out.envelope.kind == "raw" {
                 if let Ok(value) = serde_json::from_slice::<Value>(&out.envelope.payload) {
                     if let Some(tag) = value["tag"].as_str() {
