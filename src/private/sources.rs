@@ -241,10 +241,7 @@ impl Store {
         {
             return Ok(cached);
         }
-        let bytes = media
-            .fetch(transport)
-            .await
-            .map_err(|_| anyhow!("media_download_pending"))?;
+        let bytes = media.fetch(transport).await.map_err(download_failure)?;
         ensure!(
             bytes.len() as u64 == length && bytes.len() <= MAX_DOCUMENT,
             "media_size_mismatch"
@@ -283,7 +280,7 @@ impl MediaTransport for Arc<Client> {
         let buffer = self
             .download_to_writer(document, MediaBuffer::new(MAX_DOCUMENT))
             .await
-            .map_err(|_| anyhow!("media_download_pending"))?;
+            .map_err(download_failure)?;
         Ok(buffer.into_bytes())
     }
     async fn fetch_image(&self, image: &ImageMessage) -> Result<Vec<u8>> {
@@ -291,7 +288,7 @@ impl MediaTransport for Arc<Client> {
         let buffer = self
             .download_to_writer(image, MediaBuffer::new(MAX_DOCUMENT))
             .await
-            .map_err(|_| anyhow!("media_download_pending"))?;
+            .map_err(download_failure)?;
         Ok(buffer.into_bytes())
     }
     async fn fetch_audio(&self, audio: &AudioMessage) -> Result<Vec<u8>> {
@@ -299,10 +296,33 @@ impl MediaTransport for Arc<Client> {
         let buffer = self
             .download_to_writer(audio, MediaBuffer::new(MAX_DOCUMENT))
             .await
-            .map_err(|_| anyhow!("media_download_pending"))?;
+            .map_err(download_failure)?;
         Ok(buffer.into_bytes())
     }
 }
+// Preserve only fixed connector categories and the pinned streaming verifier's
+// exact integrity failures (wacore/src/download.rs). Never expose arbitrary
+// transport error text, addresses, paths, payloads or credentials.
+fn download_failure(error: anyhow::Error) -> anyhow::Error {
+    for cause in error.chain() {
+        let code = match cause.to_string().as_str() {
+            "media_metadata_missing" => "media_metadata_missing",
+            "media_metadata_invalid" => "media_metadata_invalid",
+            "media_limit_exceeded" => "media_limit_exceeded",
+            "unsupported_source" => "unsupported_source",
+            "media_integrity_failed"
+            | "MAC mismatch"
+            | "Invalid final media size"
+            | "Empty plaintext after decrypt"
+            | "Invalid PKCS7 padding"
+            | "Bad PKCS7 padding bytes" => "media_integrity_failed",
+            _ => continue,
+        };
+        return anyhow!(code);
+    }
+    anyhow!("media_download_pending")
+}
+
 fn validate_download_metadata(path: Option<&str>, key: Option<&[u8]>) -> Result<()> {
     let path = path.ok_or_else(|| anyhow!("media_metadata_missing"))?;
     ensure!(
