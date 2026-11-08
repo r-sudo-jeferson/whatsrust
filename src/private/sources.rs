@@ -1,4 +1,4 @@
-//! Full retained sources and bounded document retrieval. Unsupported content is
+//! Full retained sources and bounded typed media retrieval. Unsupported content is
 //! kept visible; decoding never grants company authority or asserts authenticity.
 use crate::storage::{InboundEnvelope, Store};
 use anyhow::{anyhow, ensure, Result};
@@ -10,7 +10,10 @@ use std::{
     sync::Arc,
 };
 use wacore_binary::jid::Jid;
-use waproto::whatsapp::{self as wa, message::DocumentMessage};
+use waproto::whatsapp::{
+    self as wa,
+    message::{AudioMessage, DocumentMessage, ImageMessage},
+};
 use whatsapp_rust::Client;
 
 const MAX_DOCUMENT: usize = 10 * 1024 * 1024;
@@ -48,6 +51,59 @@ fn document(message: &wa::Message) -> Option<&DocumentMessage> {
             .document_message
             .as_deref()
     })
+}
+enum Media<'a> {
+    Document(&'a DocumentMessage),
+    Image(&'a ImageMessage),
+    Audio(&'a AudioMessage),
+}
+impl<'a> Media<'a> {
+    fn from_message(message: &'a wa::Message) -> Result<Self> {
+        let shape = serde_json::to_value(message)?;
+        ensure!(!restricted_content(&shape), "unsupported_source");
+        ensure!(
+            !super::capabilities::classify_message_fields(&shape)
+                .iter()
+                .any(|f| f.reason == "unmapped_schema_field"),
+            "unsupported_source"
+        );
+        if let Some(m) = document(message) {
+            return Ok(Self::Document(m));
+        }
+        if let Some(m) = message.image_message.as_deref() {
+            return Ok(Self::Image(m));
+        }
+        if let Some(m) = message.audio_message.as_deref() {
+            return Ok(Self::Audio(m));
+        }
+        Err(anyhow!("unsupported_source"))
+    }
+    fn metadata(&self) -> (Option<u64>, Option<&[u8]>) {
+        match self {
+            Self::Document(m) => (m.file_length, m.file_sha256.as_deref()),
+            Self::Image(m) => (m.file_length, m.file_sha256.as_deref()),
+            Self::Audio(m) => (m.file_length, m.file_sha256.as_deref()),
+        }
+    }
+    async fn fetch(&self, transport: &dyn MediaTransport) -> Result<Vec<u8>> {
+        match self {
+            Self::Document(m) => transport.fetch(m).await,
+            Self::Image(m) => transport.fetch_image(m).await,
+            Self::Audio(m) => transport.fetch_audio(m).await,
+        }
+    }
+}
+fn restricted_content(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => fields.iter().any(|(field, v)| {
+            !v.is_null()
+                && (super::capabilities::message_field_policy(field).reason
+                    == "retention_policy_required"
+                    || restricted_content(v))
+        }),
+        Value::Array(values) => values.iter().any(restricted_content),
+        _ => false,
+    }
 }
 impl Store {
     pub async fn private_source(&self, id: &str) -> Result<PrivateSource> {
@@ -150,7 +206,7 @@ impl Store {
                 "retention_policy_required" | "unmapped_schema_field"
             )
         });
-        if protected {
+        if protected || restricted_content(&shape) {
             out.kind = "unsupported";
         }
         if matches!(out.kind, "document" | "image" | "audio" | "voice_note") {
@@ -169,18 +225,14 @@ impl Store {
             .await
             .map_err(|_| anyhow!("source_unavailable"))?;
         let (_, message) = decode(&envelope)?;
-        let document = document(&message).ok_or_else(|| anyhow!("unsupported_source"))?;
-        let length = document
-            .file_length
-            .ok_or_else(|| anyhow!("media_metadata_missing"))?;
+        let media = Media::from_message(&message)?;
+        let (length, hash) = media.metadata();
+        let length = length.ok_or_else(|| anyhow!("media_metadata_missing"))?;
         ensure!(
             length > 0 && length <= MAX_DOCUMENT as u64,
             "media_limit_exceeded"
         );
-        let hash = document
-            .file_sha256
-            .as_deref()
-            .ok_or_else(|| anyhow!("media_metadata_missing"))?;
+        let hash = hash.ok_or_else(|| anyhow!("media_metadata_missing"))?;
         ensure!(hash.len() == 32, "media_metadata_invalid");
         if let Some(cached) = self
             .retained_media(id)
@@ -189,8 +241,8 @@ impl Store {
         {
             return Ok(cached);
         }
-        let bytes = transport
-            .fetch(document)
+        let bytes = media
+            .fetch(transport)
             .await
             .map_err(|_| anyhow!("media_download_pending"))?;
         ensure!(
@@ -214,31 +266,54 @@ impl Store {
 #[async_trait::async_trait]
 pub trait MediaTransport: Send + Sync {
     async fn fetch(&self, document: &DocumentMessage) -> Result<Vec<u8>>;
+    async fn fetch_image(&self, _image: &ImageMessage) -> Result<Vec<u8>> {
+        Err(anyhow!("unsupported_source"))
+    }
+    async fn fetch_audio(&self, _audio: &AudioMessage) -> Result<Vec<u8>> {
+        Err(anyhow!("unsupported_source"))
+    }
 }
 #[async_trait::async_trait]
 impl MediaTransport for Arc<Client> {
     async fn fetch(&self, document: &DocumentMessage) -> Result<Vec<u8>> {
-        let path = document
-            .direct_path
-            .as_deref()
-            .ok_or_else(|| anyhow!("media_metadata_missing"))?;
-        ensure!(
-            path.starts_with('/')
-                && !path.starts_with("//")
-                && path.len() <= 4096
-                && !path.chars().any(|c| c.is_control() || c == '\\'),
-            "media_metadata_invalid"
-        );
-        ensure!(
-            document.media_key.as_ref().is_some_and(|k| k.len() == 32),
-            "media_metadata_invalid"
-        );
+        validate_download_metadata(
+            document.direct_path.as_deref(),
+            document.media_key.as_deref(),
+        )?;
         let buffer = self
             .download_to_writer(document, MediaBuffer::new(MAX_DOCUMENT))
             .await
             .map_err(|_| anyhow!("media_download_pending"))?;
         Ok(buffer.into_bytes())
     }
+    async fn fetch_image(&self, image: &ImageMessage) -> Result<Vec<u8>> {
+        validate_download_metadata(image.direct_path.as_deref(), image.media_key.as_deref())?;
+        let buffer = self
+            .download_to_writer(image, MediaBuffer::new(MAX_DOCUMENT))
+            .await
+            .map_err(|_| anyhow!("media_download_pending"))?;
+        Ok(buffer.into_bytes())
+    }
+    async fn fetch_audio(&self, audio: &AudioMessage) -> Result<Vec<u8>> {
+        validate_download_metadata(audio.direct_path.as_deref(), audio.media_key.as_deref())?;
+        let buffer = self
+            .download_to_writer(audio, MediaBuffer::new(MAX_DOCUMENT))
+            .await
+            .map_err(|_| anyhow!("media_download_pending"))?;
+        Ok(buffer.into_bytes())
+    }
+}
+fn validate_download_metadata(path: Option<&str>, key: Option<&[u8]>) -> Result<()> {
+    let path = path.ok_or_else(|| anyhow!("media_metadata_missing"))?;
+    ensure!(
+        path.starts_with('/')
+            && !path.starts_with("//")
+            && path.len() <= 4096
+            && !path.chars().any(|c| c.is_control() || c == '\\'),
+        "media_metadata_invalid"
+    );
+    ensure!(key.is_some_and(|k| k.len() == 32), "media_metadata_invalid");
+    Ok(())
 }
 /// A bounded streaming destination, including rewinds performed by the existing
 /// read-only download retry path. No plaintext temporary file is written.
