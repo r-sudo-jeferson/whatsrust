@@ -1,4 +1,4 @@
-//! Full retained sources and bounded document retrieval. Unsupported content is
+//! Full retained sources and bounded typed media retrieval. Unsupported content is
 //! kept visible; decoding never grants company authority or asserts authenticity.
 use crate::storage::{InboundEnvelope, Store};
 use anyhow::{anyhow, ensure, Result};
@@ -10,7 +10,10 @@ use std::{
     sync::Arc,
 };
 use wacore_binary::jid::Jid;
-use waproto::whatsapp::{self as wa, message::DocumentMessage};
+use waproto::whatsapp::{
+    self as wa,
+    message::{AudioMessage, DocumentMessage, ImageMessage},
+};
 use whatsapp_rust::Client;
 
 const MAX_DOCUMENT: usize = 10 * 1024 * 1024;
@@ -18,6 +21,11 @@ const MAX_DOCUMENT: usize = 10 * 1024 * 1024;
 pub struct PrivateSource {
     pub envelope: InboundEnvelope,
     pub kind: &'static str,
+    pub message_type: String,
+    pub reason: &'static str,
+    pub has_reply: bool,
+    pub has_mentions: bool,
+    pub fields: Vec<super::capabilities::FieldPolicy>,
     pub chat: String,
     pub sender: String,
     pub message_id: String,
@@ -44,6 +52,59 @@ fn document(message: &wa::Message) -> Option<&DocumentMessage> {
             .as_deref()
     })
 }
+enum Media<'a> {
+    Document(&'a DocumentMessage),
+    Image(&'a ImageMessage),
+    Audio(&'a AudioMessage),
+}
+impl<'a> Media<'a> {
+    fn from_message(message: &'a wa::Message) -> Result<Self> {
+        let shape = serde_json::to_value(message)?;
+        ensure!(!restricted_content(&shape), "unsupported_source");
+        ensure!(
+            !super::capabilities::classify_message_fields(&shape)
+                .iter()
+                .any(|f| f.reason == "unmapped_schema_field"),
+            "unsupported_source"
+        );
+        if let Some(m) = document(message) {
+            return Ok(Self::Document(m));
+        }
+        if let Some(m) = message.image_message.as_deref() {
+            return Ok(Self::Image(m));
+        }
+        if let Some(m) = message.audio_message.as_deref() {
+            return Ok(Self::Audio(m));
+        }
+        Err(anyhow!("unsupported_source"))
+    }
+    fn metadata(&self) -> (Option<u64>, Option<&[u8]>) {
+        match self {
+            Self::Document(m) => (m.file_length, m.file_sha256.as_deref()),
+            Self::Image(m) => (m.file_length, m.file_sha256.as_deref()),
+            Self::Audio(m) => (m.file_length, m.file_sha256.as_deref()),
+        }
+    }
+    async fn fetch(&self, transport: &dyn MediaTransport) -> Result<Vec<u8>> {
+        match self {
+            Self::Document(m) => transport.fetch(m).await,
+            Self::Image(m) => transport.fetch_image(m).await,
+            Self::Audio(m) => transport.fetch_audio(m).await,
+        }
+    }
+}
+fn restricted_content(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => fields.iter().any(|(field, v)| {
+            !v.is_null()
+                && (super::capabilities::message_field_policy(field).reason
+                    == "retention_policy_required"
+                    || restricted_content(v))
+        }),
+        Value::Array(values) => values.iter().any(restricted_content),
+        _ => false,
+    }
+}
 impl Store {
     pub async fn private_source(&self, id: &str) -> Result<PrivateSource> {
         let envelope = self
@@ -53,6 +114,11 @@ impl Store {
         let mut out = PrivateSource {
             envelope,
             kind: "unsupported",
+            message_type: "unknown".into(),
+            reason: "unmapped_source",
+            has_reply: false,
+            has_mentions: false,
+            fields: Vec::new(),
             chat: String::new(),
             sender: String::new(),
             message_id: String::new(),
@@ -60,29 +126,100 @@ impl Store {
             is_from_me: true,
         };
         if out.envelope.kind != "decoded" {
+            out.message_type = out.envelope.kind.clone();
+            out.reason = "specialized_handling_pending";
+            if out.envelope.kind == "event" {
+                let kind = out
+                    .envelope
+                    .source_id
+                    .split_once(':')
+                    .map_or(out.envelope.source_id.as_str(), |(kind, _)| kind);
+                let policy = super::capabilities::event_type_policy(kind);
+                out.message_type = kind.into();
+                out.reason = policy.reason;
+            } else if out.envelope.kind == "raw" {
+                if let Ok(value) = serde_json::from_slice::<Value>(&out.envelope.payload) {
+                    if let Some(tag) = value["tag"].as_str() {
+                        out.message_type = tag.to_owned();
+                    }
+                }
+                out.reason = "raw_protocol_source";
+            }
             return Ok(out);
         }
-        let (value, message) = decode(&out.envelope)?;
+        let Ok((value, message)) = decode(&out.envelope) else {
+            out.reason = "malformed_message";
+            return Ok(out);
+        };
+        let shape = serde_json::to_value(&message)?;
+        out.fields = super::capabilities::classify_message_fields(&shape);
+        out.message_type = out
+            .fields
+            .iter()
+            .find(|f| f.reason != "context_metadata")
+            .map(|f| f.message_type.clone())
+            .unwrap_or_else(|| "unknown".into());
+        out.reason = out
+            .fields
+            .iter()
+            .find(|f| f.reason != "context_metadata")
+            .map(|f| f.reason)
+            .unwrap_or("unknown_message");
+        out.has_reply = has_context(&shape, "stanza_id", 0);
+        out.has_mentions = has_context(&shape, "mentioned_jid", 0);
         let info = &value["info"];
-        let chat: Jid = serde_json::from_value(info["source"]["chat"].clone())
-            .map_err(|_| anyhow!("source_invalid"))?;
-        let sender: Jid = serde_json::from_value(info["source"]["sender"].clone())
-            .map_err(|_| anyhow!("source_invalid"))?;
+        let chat: Result<Jid, _> = serde_json::from_value(info["source"]["chat"].clone());
+        let sender: Result<Jid, _> = serde_json::from_value(info["source"]["sender"].clone());
+        let (Ok(chat), Ok(sender), Some(message_id)) = (chat, sender, info["id"].as_str()) else {
+            out.reason = "malformed_source_context";
+            return Ok(out);
+        };
         out.chat = chat.to_non_ad().to_string();
         out.sender = sender.to_non_ad().to_string();
-        out.message_id = info["id"]
-            .as_str()
-            .ok_or_else(|| anyhow!("source_invalid"))?
-            .into();
+        out.message_id = message_id.into();
         out.is_group = info["source"]["is_group"].as_bool().unwrap_or(true);
         out.is_from_me = info["source"]["is_from_me"].as_bool().unwrap_or(true);
         out.kind = if document(&message).is_some() {
             "document"
+        } else if message
+            .image_message
+            .as_ref()
+            .is_some_and(|m| valid_media(m.file_length, m.file_sha256.as_deref()))
+        {
+            "image"
+        } else if message
+            .audio_message
+            .as_ref()
+            .is_some_and(|m| valid_media(m.file_length, m.file_sha256.as_deref()))
+        {
+            if message
+                .audio_message
+                .as_ref()
+                .is_some_and(|m| m.ptt == Some(true))
+            {
+                "voice_note"
+            } else {
+                "audio"
+            }
         } else if message.conversation.is_some() || message.extended_text_message.is_some() {
             "text"
         } else {
             "unsupported"
         };
+        // Privacy wrappers and multiple content fields never inherit a nested media authorization.
+        let protected = out.fields.iter().any(|f| {
+            matches!(
+                f.reason,
+                "retention_policy_required" | "unmapped_schema_field"
+            )
+        });
+        if protected || restricted_content(&shape) {
+            out.kind = "unsupported";
+        }
+        if matches!(out.kind, "document" | "image" | "audio" | "voice_note") {
+            out.message_type = out.kind.into();
+            out.reason = "company_attribution_required";
+        }
         Ok(out)
     }
     pub async fn download_private(
@@ -95,18 +232,14 @@ impl Store {
             .await
             .map_err(|_| anyhow!("source_unavailable"))?;
         let (_, message) = decode(&envelope)?;
-        let document = document(&message).ok_or_else(|| anyhow!("unsupported_source"))?;
-        let length = document
-            .file_length
-            .ok_or_else(|| anyhow!("media_metadata_missing"))?;
+        let media = Media::from_message(&message)?;
+        let (length, hash) = media.metadata();
+        let length = length.ok_or_else(|| anyhow!("media_metadata_missing"))?;
         ensure!(
             length > 0 && length <= MAX_DOCUMENT as u64,
             "media_limit_exceeded"
         );
-        let hash = document
-            .file_sha256
-            .as_deref()
-            .ok_or_else(|| anyhow!("media_metadata_missing"))?;
+        let hash = hash.ok_or_else(|| anyhow!("media_metadata_missing"))?;
         ensure!(hash.len() == 32, "media_metadata_invalid");
         if let Some(cached) = self
             .retained_media(id)
@@ -115,10 +248,7 @@ impl Store {
         {
             return Ok(cached);
         }
-        let bytes = transport
-            .fetch(document)
-            .await
-            .map_err(|_| anyhow!("media_download_pending"))?;
+        let bytes = media.fetch(transport).await.map_err(download_failure)?;
         ensure!(
             bytes.len() as u64 == length && bytes.len() <= MAX_DOCUMENT,
             "media_size_mismatch"
@@ -140,31 +270,77 @@ impl Store {
 #[async_trait::async_trait]
 pub trait MediaTransport: Send + Sync {
     async fn fetch(&self, document: &DocumentMessage) -> Result<Vec<u8>>;
+    async fn fetch_image(&self, _image: &ImageMessage) -> Result<Vec<u8>> {
+        Err(anyhow!("unsupported_source"))
+    }
+    async fn fetch_audio(&self, _audio: &AudioMessage) -> Result<Vec<u8>> {
+        Err(anyhow!("unsupported_source"))
+    }
 }
 #[async_trait::async_trait]
 impl MediaTransport for Arc<Client> {
     async fn fetch(&self, document: &DocumentMessage) -> Result<Vec<u8>> {
-        let path = document
-            .direct_path
-            .as_deref()
-            .ok_or_else(|| anyhow!("media_metadata_missing"))?;
-        ensure!(
-            path.starts_with('/')
-                && !path.starts_with("//")
-                && path.len() <= 4096
-                && !path.chars().any(|c| c.is_control() || c == '\\'),
-            "media_metadata_invalid"
-        );
-        ensure!(
-            document.media_key.as_ref().is_some_and(|k| k.len() == 32),
-            "media_metadata_invalid"
-        );
+        validate_download_metadata(
+            document.direct_path.as_deref(),
+            document.media_key.as_deref(),
+        )?;
         let buffer = self
             .download_to_writer(document, MediaBuffer::new(MAX_DOCUMENT))
             .await
-            .map_err(|_| anyhow!("media_download_pending"))?;
+            .map_err(download_failure)?;
         Ok(buffer.into_bytes())
     }
+    async fn fetch_image(&self, image: &ImageMessage) -> Result<Vec<u8>> {
+        validate_download_metadata(image.direct_path.as_deref(), image.media_key.as_deref())?;
+        let buffer = self
+            .download_to_writer(image, MediaBuffer::new(MAX_DOCUMENT))
+            .await
+            .map_err(download_failure)?;
+        Ok(buffer.into_bytes())
+    }
+    async fn fetch_audio(&self, audio: &AudioMessage) -> Result<Vec<u8>> {
+        validate_download_metadata(audio.direct_path.as_deref(), audio.media_key.as_deref())?;
+        let buffer = self
+            .download_to_writer(audio, MediaBuffer::new(MAX_DOCUMENT))
+            .await
+            .map_err(download_failure)?;
+        Ok(buffer.into_bytes())
+    }
+}
+// Preserve only fixed connector categories and the pinned streaming verifier's
+// exact integrity failures (wacore/src/download.rs). Never expose arbitrary
+// transport error text, addresses, paths, payloads or credentials.
+fn download_failure(error: anyhow::Error) -> anyhow::Error {
+    for cause in error.chain() {
+        let code = match cause.to_string().as_str() {
+            "media_metadata_missing" => "media_metadata_missing",
+            "media_metadata_invalid" => "media_metadata_invalid",
+            "media_limit_exceeded" => "media_limit_exceeded",
+            "unsupported_source" => "unsupported_source",
+            "media_integrity_failed"
+            | "MAC mismatch"
+            | "Invalid final media size"
+            | "Empty plaintext after decrypt"
+            | "Invalid PKCS7 padding"
+            | "Bad PKCS7 padding bytes" => "media_integrity_failed",
+            _ => continue,
+        };
+        return anyhow!(code);
+    }
+    anyhow!("media_download_pending")
+}
+
+fn validate_download_metadata(path: Option<&str>, key: Option<&[u8]>) -> Result<()> {
+    let path = path.ok_or_else(|| anyhow!("media_metadata_missing"))?;
+    ensure!(
+        path.starts_with('/')
+            && !path.starts_with("//")
+            && path.len() <= 4096
+            && !path.chars().any(|c| c.is_control() || c == '\\'),
+        "media_metadata_invalid"
+    );
+    ensure!(key.is_some_and(|k| k.len() == 32), "media_metadata_invalid");
+    Ok(())
 }
 /// A bounded streaming destination, including rewinds performed by the existing
 /// read-only download retry path. No plaintext temporary file is written.
@@ -215,5 +391,29 @@ impl Seek for MediaBuffer {
         }
         self.rewound = next == 0;
         Ok(next)
+    }
+}
+
+fn valid_media(length: Option<u64>, hash: Option<&[u8]>) -> bool {
+    length.is_some_and(|n| n > 0 && n <= MAX_DOCUMENT as u64) && hash.is_some_and(|h| h.len() == 32)
+}
+fn has_context(value: &Value, field: &str, depth: usize) -> bool {
+    if depth > 12 {
+        return false;
+    }
+    match value {
+        Value::Object(map) => map.iter().any(|(key, child)| {
+            if key == "context_info" {
+                let v = &child[field];
+                if v.as_str().is_some_and(|s| !s.is_empty())
+                    || v.as_array().is_some_and(|a| !a.is_empty())
+                {
+                    return true;
+                }
+            }
+            has_context(child, field, depth + 1)
+        }),
+        Value::Array(items) => items.iter().any(|v| has_context(v, field, depth + 1)),
+        _ => false,
     }
 }
